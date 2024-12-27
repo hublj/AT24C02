@@ -7,7 +7,7 @@
 #include <WiFiUdp.h>
 #include <WiFiManager.h>
 
-// 全局声明每页64字节
+// 全局声明每页8字节，32页
 #define EEPROM_PAGE_SIZE 8
 #define EEPROM_TOTAL_SIZE 256 // 根据24C02芯片容量2K位换算成字节得到，即256字节
 
