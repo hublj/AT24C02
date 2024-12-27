@@ -1,0 +1,387 @@
+#include <ESP8266WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP8266WebServer.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <WiFiManager.h>
+
+// 24C02 EEPROM相关定义
+#define EEPROM_ADDRESS 0x50
+#define EEPROM_PAGE_SIZE 8
+#define EEPROM_TOTAL_SIZE 256
+
+// 自定义SDA和SCL引脚
+#define SDA_PIN D9
+#define SCL_PIN D10
+
+// 设置OLED屏幕的宽度和高度
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// 设置NTP服务器和时区
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 3600 * 8);
+
+// 定义输出引脚
+const int relay1Pin = 0;
+const int relay2Pin = 2;
+
+// 定义OLED的I2C引脚
+const int sclPin = 1;
+const int sdaPin = 3;
+
+// 全局变量，用于记录上次检查IP的时间
+unsigned long lastIPCheckTime = 0;
+
+// OLED屏幕对象
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Web服务器对象
+ESP8266WebServer server(80);
+
+// 结构体存储时间信息
+struct TimeInfo {
+    int hour;
+    int minute;
+    int second;
+    int day;
+    int month;
+    int year;
+};
+
+// 存储定时的开始小时和分钟
+int startHourForGroup1 = 0;
+int startMinuteForGroup1 = 0;
+// 存储定时的结束小时和分钟
+int endHourForGroup1 = 0;
+int endMinuteForGroup1 = 0;
+// 存储第二个定时的开始小时和分钟
+int startHourForGroup2 = 0;
+int startMinuteForGroup2 = 0;
+// 存储第二个定时的结束小时和分钟
+int endHourForGroup2 = 0;
+int endMinuteForGroup2 = 0;
+// 标志位，判断是否设置了定时
+bool isTimedGroup1 = false;
+bool isTimedGroup2 = false;
+
+// 登录状态标志
+bool isLoggedIn = false;
+// 管理员用户名和密码
+const char* adminUsername = "admin";
+const char* adminPassword = "password";
+
+// 函数声明
+TimeInfo getCurrentTime();
+void updateOLED();
+void handleRoot();
+void handleSetTime1();
+void handleSetTime2();
+void handleCancelTiming1();
+void handleCancelTiming2();
+void handleRelay1();
+void handleRelay2();
+void handleLogin();
+void handleTaskList();
+void writeEEPROM(int address, const char* data, int length);
+String readEEPROM(int address, int length);
+bool isInOnPeriod(int startHour, int startMinute, int endHour, int endMinute);
+void writeTimingSettingsToEEPROM();
+void readTimingSettingsFromEEPROM();
+void setup();
+void loop();
+
+// 向EEPROM写入数据的函数，添加写入重试机制和更详细的错误处理
+void writeEEPROM(int address, const char* data, int length) {
+    int maxRetries = 3; // 最大重试次数
+    for (int retry = 0; retry < maxRetries; retry++) {
+        Wire.beginTransmission(EEPROM_ADDRESS);
+        Wire.write((int)(address >> 8));
+        Wire.write((int)(address & 0xFF));
+
+        int bytesToWrite = length;
+        if ((address % EEPROM_PAGE_SIZE) + length > EEPROM_PAGE_SIZE) {
+            bytesToWrite = EEPROM_PAGE_SIZE - (address % EEPROM_PAGE_SIZE);
+        }
+
+        for (int i = 0; i < bytesToWrite; i++) {
+            Wire.write(data[i]);
+        }
+
+        if (Wire.endTransmission() == 0) {
+            return; // 写入成功，直接返回
+        }
+
+        Serial.print("EEPROM写入数据出现错误，地址: ");
+        Serial.println(address);
+        Serial.print("正在重试...重试次数: ");
+        Serial.println(retry + 1);
+        delay(100); // 重试间隔
+    }
+    Serial.print("多次重试后，EEPROM写入数据仍然失败，地址: ");
+    Serial.println(address);
+}
+
+// 从EEPROM读取数据的函数，添加读取结果判断和错误提示
+String readEEPROM(int address, int length) {
+    if (address + length > EEPROM_TOTAL_SIZE) {
+        Serial.println("读取地址超出EEPROM总容量范围");
+        return "";
+    }
+
+    String data = "";
+    Wire.beginTransmission(EEPROM_ADDRESS);
+    Wire.write((int)(address >> 8));
+    Wire.write((int)(address & 0xFF));
+    Wire.endTransmission(false);
+    Wire.requestFrom(EEPROM_ADDRESS, length);
+
+    int receivedBytes = 0;
+    while (Wire.available()) {
+        char c = Wire.read();
+        data += c;
+        receivedBytes++;
+    }
+
+    if (receivedBytes!= length) {
+        Serial.print("从EEPROM读取数据出现错误，期望读取 ");
+        Serial.print(length);
+        Serial.print(" 字节，实际读取 ");
+        Serial.print(receivedBytes);
+        Serial.print(" 字节，地址: ");
+        Serial.println(address);
+    }
+
+    return data;
+}
+
+// 判断当前时间是否在指定的定时时间段内
+bool isInOnPeriod(int startHour, int startMinute, int endHour, int endMinute) {
+    TimeInfo currentTime = getCurrentTime();
+    int currentHour = currentTime.hour;
+    int currentMinute = currentTime.minute;
+
+    if (startHour < endHour) {
+        return (currentHour > startHour || (currentHour == startHour && currentMinute >= startMinute)) &&
+               (currentHour < endHour || (currentHour == endHour && currentMinute <= endMinute));
+    } else if (startHour > endHour) {
+        return (currentHour > startHour || (currentHour == startHour && currentMinute >= startMinute)) ||
+               (currentHour < endHour || (currentHour == endHour && currentMinute <= endMinute));
+    } else {
+        return (currentMinute >= startMinute && currentMinute <= endMinute);
+    }
+}
+
+// 将定时设置数据写入EEPROM的函数，添加地址范围检查
+void writeTimingSettingsToEEPROM() {
+    if (0 + 8 > EEPROM_TOTAL_SIZE || 8 + 8 > EEPROM_TOTAL_SIZE) {
+        Serial.println("定时设置数据写入地址超出合理范围");
+        return;
+    }
+
+    // 构建定时1的数据字符串，确保格式化为固定长度（这里假设总长度8字节，格式如：0000000，前6位分别为时分时分，最后一位为是否定时标志）
+    char data1[8];
+    sprintf(data1, "%02d%02d%02d%02d%c", startHourForGroup1, startMinuteForGroup1, endHourForGroup1, endMinuteForGroup1, isTimedGroup1? '1' : '0');
+    writeEEPROM(0, data1, 8);
+
+    // 构建定时2的数据字符串
+    char data2[8];
+    sprintf(data2, "%02d%02d%02d%02d%c", startHourForGroup2, startMinuteForGroup2, endHourForGroup2, endMinuteForGroup2, isTimedGroup2? '1' : '0');
+    writeEEPROM(8, data2, 8);
+}
+
+// 从EEPROM读取定时设置数据的函数，添加数据合法性检查和读取前后延迟
+void readTimingSettingsFromEEPROM() {
+    delay(20); // 读取前增加延迟
+
+    // 读取定时1的设置
+    String data = readEEPROM(0, 8);
+    if (data.length() == 8) {
+        bool isValid = true;
+        for (int i = 0; i < 6; i++) {
+            if (data[i] < '0' || data[i] > '9') {
+                isValid = false;
+                break;
+            }
+        }
+        if (isValid) {
+            startHourForGroup1 = data.substring(0, 2).toInt();
+            startMinuteForGroup1 = data.substring(2, 4).toInt();
+            endHourForGroup1 = data.substring(4, 6).toInt();
+            endMinuteForGroup1 = data.substring(6, 8).toInt();
+            isTimedGroup1 = data.substring(6, 7) == "1";
+        } else {
+            Serial.println("定时1读取到的数据存在非法字符");
+        }
+    }
+
+    // 读取定时2的设置
+    data = readEEPROM(8, 8);
+    if (data.length() == 8) {
+        bool isValid = true;
+        for (int i = 0; i < 6; i++) {
+            if (data[i] < '0' || data[i] > '9') {
+                isValid = false;
+                break;
+            }
+        }
+        if (isValid) {
+            startHourForGroup2 = data.substring(0, 2).toInt();
+            startMinuteForGroup2 = data.substring(2, 4).toInt();
+            endHourForGroup2 = data.substring(4, 6).toInt();
+            endMinuteForGroup2 = data.substring(6, 8).toInt();
+            isTimedGroup2 = data.substring(6, 7) == "1";
+        } else {
+            Serial.println("定时2读取到的数据存在非法字符");
+        }
+    }
+
+    delay(20); // 读取后增加延迟
+}
+
+// 处理根路由的函数
+void handleRoot() {
+    if (!isLoggedIn) {
+        server.sendHeader("Location", "/login");
+        server.send(303);
+        return;
+    }
+    String html = "<!DOCTYPE html>"
+                  "<html lang=\"zh-CN\">"
+                  "<head>"
+                  "<meta charset=\"UTF-8\">"
+                  "<title>继电器控制</title>"
+                  "<style>"
+                  "body {"
+                  " background-color: #4CAF50;"
+                  " color: white;"
+                  " font-family: Arial, sans-serif;"
+                  " text-align: center;"
+                  " padding-top: 50px;"
+                  "}"
+                  "a {"
+                  " display: block;"
+                  " margin: 20px 0;"
+                  " padding: 10px 20px;"
+                  " background-color: #008CBA;"
+                  " color: white;"
+                  " text-decoration: none;"
+                  " border-radius: 5px;"
+                  "}"
+                  "a:hover {"
+                  " background-color: #005f73;"
+                  "}"
+                  "</style>"
+                  "</head>"
+                  "<body>"
+                  "<h1>继电器控制</h1>"
+                  "<p><a href=\"/relay1?state=1\">打开继电器1</a></p>"
+                  "<p><a href=\"/relay1?state=0\">关闭继电器1</a></p>"
+                  "<p><a href=\"/relay2?state=1\">打开继电器2</a></p>"
+                  "<p><a href=\"/relay2?state=0\">关闭继电器2</a></p>"
+                  "<p><a href=\"/setTime1\">设置定时 - 组1</a></p>"
+                  "<p><a href=\"/setTime2\">设置定时 - 组2</a></p>"
+                  "<p><a href=\"/cancelTiming1\">取消定时 - 组1</a></p>"
+                  "<p><a href=\"/cancelTiming2\">取消定时 - 组2</a></p>"
+                  "<p><a href=\"/taskList\">查看任务列表</a></p>"
+                  "<p><a href=\"/reboot\">重启设备</a></p>"
+                  // 添加重启设备按钮
+                  "<p><a href=\"/clearWifiConfig\">清除配置网络</a></p>"
+                  // 添加清除配置网络按钮
+                  "</body>"
+                  "</html>";
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+// 处理设置定时1的函数
+void handleSetTime1() {
+    if (!isLoggedIn) {
+        server.sendHeader("Location", "/login");
+        server.send(303);
+        return;
+    }
+    if (server.method() == HTTP_POST) {
+        startHourForGroup1 = server.arg("startHourForGroup1").toInt();
+        startMinuteForGroup1 = server.arg("startMinuteForGroup1").toInt();
+        endHourForGroup1 = server.arg("endHourForGroup1").toInt();
+        endMinuteForGroup1 = server.arg("endMinuteForGroup1").toInt();
+        isTimedGroup1 = true;
+        // 将定时设置写入EEPROM
+        writeTimingSettingsToEEPROM();
+        server.send(200, "text/html; charset=utf-8", "设置成功！");
+    } else if (server.method() == HTTP_GET) {
+        String html = "<html><head><meta charset=\"UTF-8\"></head><body>"
+                      "<style>"
+                      "body {"
+                      " background-color: #0074D9;"
+                      " color: white;"
+                      " font-family: Arial, sans-serif;"
+                      " text-align: center;"
+                      " padding-top: 50px;"
+                      "}"
+                      "form {"
+                      " margin-top: 50px;"
+                      "}"
+                      "input {"
+                      " padding: 10px; margin: 10px;"
+                      "}"
+                      "button {"
+                      " padding: 10px 20px;"
+                      "}"
+                      "</style>"
+                      "<h1>设置定时时间 - 组1</h1>"
+                      "<form method='post' action='/setTime1'>"
+                      "开启时间：<br>"
+                      "小时：<input type='number' name='startHourForGroup1' min='0' max='23' value='" + String(startHourForGroup1) + "'>"
+                      "分钟：<input type='number' name='startMinuteForGroup1' min='0' max='59' value='" + String(startMinuteForGroup1) + "'><br><br>"
+                      "关闭时间：<br>"
+                      "小时：<input type='number' name='endHourForGroup1' min='0' max='23' value='" + String(endHourForGroup1) + "'>"
+                      "分钟：<input type='number' name='endMinuteForGroup1' min='0' max='59' value='" + String(endMinuteForGroup1) + "'><br><br>"
+                      "<input type='submit' value='设置定时'>"
+                      "</form>"
+                      "</body></html>";
+        server.send(200, "text/html; charset=utf-8", html);
+    }
+}
+
+// 处理设置定时2的函数
+void handleSetTime2() {
+    if (!isLoggedIn) {
+        server.sendHeader("Location", "/login");
+        server.send(303);
+        return;
+    }
+    if (server.method() == HTTP_POST) {
+        startHourForGroup2 = server.arg("startHourForGroup2").toInt();
+        startMinuteForGroup2 = server.arg("startMinuteForGroup2").toInt();
+        endHourForGroup2 = server.arg("endHourForGroup2").toInt();
+        endMinuteForGroup2 = server.arg("endMinuteForGroup2").toInt();
+        isTimedGroup2 = true;
+        // 将定时设置写入EEPROM
+        writeTimingSettingsToEEPROM();
+        server.send(200, "text/html; charset=utf-8", "设置成功！");
+    } else if (server.method() == HTTP_GET) {
+        String html = "<html><head><meta charset=\"UTF-8\"></head><body>"
+                      "<style>"
+                      "body {"
+                      " background-color: #0074D9;"
+                      " color: white;"
+                      " font-family: Arial, sans-serif;"
+                      " text-align: center;"
+                      " padding-top: 50px;"
+                      "}"
+                      "form {"
+                      " margin-top: 50px;"
+                      "}"
+                      "input {"
+                      " padding: 10px; margin: 10px;"
+                      "}"
+                      "button {"
+                      " padding: 10px 20px;"
+                      "}"
+                      "</style>"
+                      "<h1>设置定时时间 - 组2</h1>"
+                      "<form method='post' action='/setTime2'>"
+                      "开启时间：<br>"
