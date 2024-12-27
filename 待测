@@ -1,0 +1,171 @@
+#include <Wire.h>
+
+// AT24C02 EEPROM相关定义
+#define EEPROM_ADDRESS 0x50  // 经测试正确的地址
+#define EEPROM_PAGE_SIZE 8
+#define EEPROM_TOTAL_SIZE 256
+
+// 向EEPROM写入数据的函数，考虑页边界及写入重试机制、错误处理
+void writeEEPROM(int address, const char* data) {
+    int dataLength = strlen(data);
+    int currentAddress = address;
+    int currentPage = currentAddress / EEPROM_PAGE_SIZE;
+    int offsetInPage = currentAddress % EEPROM_PAGE_SIZE;
+    int bytesToWriteInCurrentPage = EEPROM_PAGE_SIZE - offsetInPage;
+    int remainingBytes = dataLength;
+
+    while (remainingBytes > 0) {
+        Wire.beginTransmission(EEPROM_ADDRESS);
+        Wire.write((int)(currentAddress >> 8));
+        Wire.write((int)(currentAddress & 0xFF));
+
+        int bytesToWriteThisTime = min(remainingBytes, bytesToWriteInCurrentPage);
+        for (int i = 0; i < bytesToWriteThisTime; i++) {
+            Wire.write(data[i]);
+            // 调整写入延时，根据芯片手册要求设置合适的值，这里假设为10ms
+            delay(10);  
+        }
+
+        if (Wire.endTransmission()!= 0) {
+            Serial.println("EEPROM写入数据出现错误，地址: " + String(currentAddress) + "，正在重试...");
+            int maxRetries = 3;
+            for (int retry = 0; retry < maxRetries; retry++) {
+                if (Wire.endTransmission() == 0) {
+                    break;
+                }
+                Serial.println("重试中...");
+                delay(100);
+            }
+            if (Wire.endTransmission()!= 0) {
+                Serial.println("多次重试后，EEPROM写入数据仍然失败，地址: " + String(currentAddress));
+            }
+        }
+
+        remainingBytes -= bytesToWriteThisTime;
+        currentAddress += bytesToWriteThisTime;
+        currentPage = currentAddress / EEPROM_PAGE_SIZE;
+        offsetInPage = currentAddress % EEPROM_PAGE_SIZE;
+        bytesToWriteInCurrentPage = EEPROM_PAGE_SIZE - offsetInPage;
+    }
+}
+
+// 从EEPROM读取数据的函数，添加地址范围判断及读取结果判断、错误提示
+String readEEPROM(int address, int length) {
+    if (address + length > EEPROM_TOTAL_SIZE) {
+        Serial.println("读取地址超出EEPROM总容量范围");
+        return "";
+    }
+
+    String data = "";
+    Wire.beginTransmission(EEPROM_ADDRESS);
+    Wire.write((int)(address >> 8));
+    Wire.write((int)(address & 0xFF));
+    Wire.endTransmission(false);
+    Wire.requestFrom(EEPROM_ADDRESS, length);
+
+    int receivedBytes = 0;
+    while (Wire.available()) {
+        char c = Wire.read();
+        data += c;
+        receivedBytes++;
+    }
+
+    if (receivedBytes!= length) {
+        Serial.println("从EEPROM读取数据出现错误，期望读取 " + String(length) + " 字节，实际读取 " + String(receivedBytes) + " 字节，地址: " + String(address));
+    }
+
+    return data;
+}
+
+// 从EEPROM读取定时设置数据的函数，添加数据合法性检查和读取前后延迟
+void readTimingSettingsFromEEPROM() {
+    // 读取前增加适当延迟，根据实际情况调整
+    delay(10);  
+
+    // 读取定时1的设置
+    String data = readEEPROM(0, 8);
+    if (data.length() == 8) {
+        bool isValid = true;
+        for (int i = 0; i < 6; i++) {
+            if (data[i] < '0' || data[i] > '9') {
+                isValid = false;
+                break;
+            }
+        }
+        if (isValid) {
+            int startHourForGroup1 = data.substring(0, 2).toInt();
+            int startMinuteForGroup1 = data.substring(2, 4).toInt();
+            int endHourForGroup1 = data.substring(4, 6).toInt();
+            int endMinuteForGroup1 = data.substring(6, 8).toInt();
+            bool isTimedGroup1 = data.substring(8, 9) == "1";
+            // 在这里可以进行定时1设置的后续处理
+        } else {
+            Serial.println("定时1读取到的数据存在非法字符");
+        }
+    }
+
+    // 读取定时2的设置
+    data = readEEPROM(10, 8);
+    if (data.length() == 8) {
+        bool isValid = true;
+        for (int i = 0; i < 6; i++) {
+            if (data[i] < '0' || data[i] > '9') {
+                isValid = false;
+                break;
+            }
+        }
+        if (isValid) {
+            int startHourForGroup2 = data.substring(0, 2).toInt();
+            int startMinuteForGroup2 = data.substring(2, 4).toInt();
+            int endHourForGroup2 = data.substring(4, 6).toInt();
+            int endMinuteForGroup2 = data.substring(6, 8).toInt();
+            bool isTimedGroup2 = data.substring(8, 9) == "1";
+            // 在这里可以进行定时2设置的后续处理
+        } else {
+            Serial.println("定时2读取到的数据存在非法字符");
+        }
+    }
+
+    // 读取后增加适当延迟，根据实际情况调整
+    delay(10);  
+}
+
+// 将定时设置数据写入EEPROM的函数，添加地址范围检查
+void writeTimingSettingsToEEPROM() {
+    // 检查定时1数据写入地址范围
+    if (0 + 8 > EEPROM_TOTAL_SIZE) {
+        Serial.println("定时1设置数据写入地址超出AT24C02合理范围");
+        return;
+    }
+
+    // 构建定时1的数据字符串，确保格式化为固定长度
+    char data1[8];
+    sprintf(data1, "%02d%02d%02d%02d%c", startHourForGroup1, startMinuteForGroup1, endHourForGroup1, endMinuteForGroup1, isTimedGroup1? '1' : '0');
+    writeEEPROM(0, data1);
+
+    // 检查定时2数据写入地址范围
+    if (10 + 8 > EEPROM_TOTAL_SIZE) {
+        Serial.println("定时2设置数据写入地址超出AT24C02合理范围");
+        return;
+    }
+
+    // 构建定时2的数据字符串
+    char data2[8];
+    sprintf(data2, "%02d%02d%02d%02d%c", startHourForGroup2, startMinuteForGroup2, endHourForGroup2, endMinuteForGroup2, isTimedGroup2? '1' : '0');
+    writeEEPROM(10, data2);
+}
+
+void setup() {
+    Serial.begin(9600);
+    Wire.begin();  // 初始化I2C总线
+}
+
+void loop() {
+    // 在这里可以调用读写函数进行测试，例如：
+    char testData[] = "12345678";
+    writeEEPROM(0, testData);
+    String readData = readEEPROM(0, 8);
+    Serial.println("读取到的数据: " + readData);
+
+    delay(5000);
+}
