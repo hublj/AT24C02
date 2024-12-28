@@ -1,0 +1,334 @@
+// 计算CRC - 8值
+uint8_t calculateCRC8(const char *data, int length) {
+    uint8_t crc = 0;
+    for (int i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            if (crc & 0x80) {
+                crc = (crc << 1) ^ 0x31;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+void writeEEPROM(int address, const char* data, int length) {
+    if (address < 0 || address + length > EEPROM_TOTAL_SIZE) {
+        // 地址超出范围处理
+        Serial.println("写入地址超出EEPROM范围");
+        return;
+    }
+    int adjustedAddress = address;
+    const char* adjustedData = data;
+    int adjustedLength = length;
+    if (address % EEPROM_PAGE_SIZE!= 0) {
+        int offset = EEPROM_PAGE_SIZE - (address % EEPROM_PAGE_SIZE);
+        adjustedLength = min(offset, length);
+        adjustedAddress = address & ~(EEPROM_PAGE_SIZE - 1);
+        adjustedData = data - (address % EEPROM_PAGE_SIZE);
+    }
+    const int maxRetries = 3;
+    int currentAddress = adjustedAddress;
+    int currentIndex = 0;
+    while (currentIndex < adjustedLength) {
+        int bytesToWrite = min(EEPROM_PAGE_SIZE - (currentAddress % EEPROM_PAGE_SIZE), adjustedLength - currentIndex);
+        for (int retry = 0; retry < maxRetries; retry++) {
+            Wire.beginTransmission(EEPROM_ADDRESS);
+            Wire.write(currentAddress);
+            for (int i = 0; i < bytesToWrite; i++) {
+                Wire.write(adjustedData[currentIndex + i]);
+            }
+            if (Wire.endTransmission() == 0) {
+                break;
+            }
+            Serial.print("写入失败，重试次数: ");
+            Serial.print(retry + 1);
+            Serial.print(" 地址: ");
+            Serial.println(currentAddress);
+        }
+        currentIndex += bytesToWrite;
+        currentAddress += bytesToWrite;
+        delay(100); // 适当增加延迟
+    }
+    // 处理剩余数据
+    if (length > adjustedLength) {
+        writeEEPROM(adjustedAddress + adjustedLength, data + adjustedLength, length - adjustedLength);
+    }
+}
+
+// 从24C02读取数据的函数
+void readEEPROM(int address, char* data, int length) {
+    if (address < 0 || address + length > EEPROM_TOTAL_SIZE) {
+        // 地址超出范围处理
+        Serial.println("读取地址超出EEPROM范围");
+        return;
+    }
+    Wire.beginTransmission(EEPROM_ADDRESS);
+    Wire.write(address);
+    Wire.endTransmission(false);
+    Wire.requestFrom(EEPROM_ADDRESS, length);
+    int i = 0;
+    while (Wire.available() && i < length) {
+        data[i] = Wire.read();
+        i++;
+    }
+    if (i!= length) {
+        Serial.print("读取数据不完整，期望读取 ");
+        Serial.print(length);
+        Serial.print(" 字节，实际读取 ");
+        Serial.print(i);
+        Serial.println(" 字节");
+        return;
+    }
+    // 再次读取验证
+    char verifyData[length];
+    Wire.beginTransmission(EEPROM_ADDRESS);
+    Wire.write(address);
+    Wire.endTransmission(false);
+    Wire.requestFrom(EEPROM_ADDRESS, length);
+    int j = 0;
+    while (Wire.available() && j < length) {
+        verifyData[j] = Wire.read();
+        j++;
+    }
+    bool isSame = true;
+    for (int k = 0; k < length; k++) {
+        if (data[k]!= verifyData[k]) {
+            isSame = false;
+            break;
+        }
+    }
+    if (!isSame) {
+        Serial.print("从地址 ");
+        Serial.print(address);
+        Serial.println(" 读取数据成功但验证失败");
+        return;
+    }
+    // 检查读取数据中是否有不可打印字符
+    bool isValid = true;
+    for (int k = 0; k < length; k++) {
+        if (!isprint(data[k])) {
+            isValid = false;
+            Serial.print("从地址 ");
+            Serial.print(address);
+            Serial.print(" 读取的数据中位置 ");
+            Serial.print(k);
+            Serial.println(" 存在不可打印字符");
+            break;
+        }
+    }
+    if (isValid) {
+        Serial.print("从地址 ");
+        Serial.print(address);
+        Serial.println(" 读取数据成功且验证通过");
+    }
+}
+
+// 从24C02读取定时设置数据的函数
+void readTimingSettingsFromEEPROM() {
+    const int maxReadRetries = 3;
+    delay(20);
+    // 读取定时1的设置
+    char combinedData1[13];
+    int retry;
+    for (retry = 0; retry < maxReadRetries; retry++) {
+        readEEPROM(0, combinedData1, 13);
+        Serial.print("定时1读取到的数据: ");
+        for (int i = 0; i < 13; i++) {
+            Serial.print(combinedData1[i]);
+        }
+        Serial.println();
+        // 检查数据长度
+        if (strlen(combinedData1)!= 13) {
+            Serial.println("定时1读取数据长度不正确");
+            continue;
+        }
+        char data1[12];
+        memcpy(data1, combinedData1, 12);
+        // 计算读取数据的CRC - 8值
+        uint8_t calculatedCRC1 = calculateCRC8(data1, 12);
+        // 比较CRC值
+        if (calculatedCRC1 == combinedData1[12]) {
+            bool isValid = true;
+            if (strlen(data1)!= 12) {
+                isValid = false;
+                Serial.println("定时1读取的数据字符串长度不正确");
+            } else {
+                int startHour = atoi(&data1[0]);
+                int startMinute = atoi(&data1[2]);
+                int endHour = atoi(&data1[4]);
+                int endMinute = atoi(&data1[6]);
+                // 检查时间逻辑
+                if (startHour < 0 || startHour > 23 || startMinute < 0 || startMinute > 59 ||
+                    endHour < 0 || endHour > 23 || endMinute < 0 || endMinute > 59 ||
+                    (startHour == endHour && startMinute >= endMinute) || startHour > endHour) {
+                    isValid = false;
+                    Serial.println("定时1读取的时间数据逻辑错误");
+                }
+                if (data1[8]!= '0' && data1[8]!= '1') {
+                    isValid = false;
+                    Serial.println("定时1读取的标志字符不正确");
+                }
+                for (int i = 0; i < 12; i++) {
+                    if (!isprint(data1[i])) {
+                        isValid = false;
+                        Serial.print("定时1读取数据中位置 ");
+                        Serial.print(i);
+                        Serial.println(" 存在不可打印字符");
+                        break;
+                    }
+                }
+            }
+            if (isValid) {
+                startHourForGroup1 = atoi(&data1[0]);
+                startMinuteForGroup1 = atoi(&data1[2]);
+                endHourForGroup1 = atoi(&data1[4]);
+                endMinuteForGroup1 = atoi(&data1[6]);
+                isTimedGroup1 = data1[8] == '1';
+                break;
+            }
+        } else {
+            Serial.println("定时1读取数据CRC校验失败");
+        }
+    }
+    if (retry == maxReadRetries - 1) {
+        Serial.println("多次重试读取定时1数据，均存在非法字符");
+    }
+    // 读取定时2的设置
+    char combinedData2[13];
+    for (retry = 0; retry < maxReadRetries; retry++) {
+        readEEPROM(12, combinedData2, 13);
+        Serial.print("定时2读取到的数据: ");
+        for (int i = 0; i < 13; i++) {
+            Serial.print(combinedData2[i]);
+        }
+        Serial.println();
+        // 检查数据长度
+        if (strlen(combinedData2)!= 13) {
+            Serial.println("定时2读取数据长度不正确");
+            continue;
+        }
+        char data2[12];
+        memcpy(data2, combinedData2, 12);
+        // 计算读取数据的CRC - 8值
+        uint8_t calculatedCRC2 = calculateCRC8(data2, 12);
+        // 比较CRC值
+        if (calculatedCRC2 == combinedData2[12]) {
+            bool isValid = true;
+            if (strlen(data2)!= 12) {
+                isValid = false;
+                Serial.println("定时2读取的数据字符串长度不正确");
+            } else {
+                int startHour = atoi(&data2[0]);
+                int startMinute = atoi(&data2[2]);
+                int endHour = atoi(&data2[4]);
+                int endMinute = atoi(&data2[6]);
+                // 检查时间逻辑
+                if (startHour < 0 || startHour > 23 || startMinute < 0 || startMinute > 59 ||
+                    endHour < 0 || endHour > 23 || endMinute < 0 || endMinute > 59 ||
+                    (startHour == endHour && startMinute >= endMinute) || startHour > endHour) {
+                    isValid = false;
+                    Serial.println("定时2读取的时间数据逻辑错误");
+                }
+                if (data2[8]!= '0' && data2[8]!= '1') {
+                    isValid = false;
+                    Serial.println("定时2读取的标志字符不正确");
+                }
+                for (int i = 0; i < 12; i++) {
+                    if (!isprint(data2[i])) {
+                        isValid = false;
+                        Serial.print("定时2读取数据中位置 ");
+                        Serial.print(i);
+                        Serial.println(" 存在不可打印字符");
+                        break;
+                    }
+                }
+            }
+            if (isValid) {
+                startHourForGroup2 = atoi(&data2[0]);
+                startMinuteForGroup2 = atoi(&data2[2]);
+                endHourForGroup2 = atoi(&data2[4]);
+                endMinuteForGroup2 = atoi(&data2[6]);
+                isTimedGroup2 = data2[8] == '1';
+                break;
+            }
+        } else {
+            Serial.println("定时2读取数据CRC校验失败");
+        }
+    }
+    if (retry == maxReadRetries - 1) {
+        Serial.println("多次重试读取定时2数据，均存在非法字符");
+    }
+    delay(20);
+}
+// 将定时设置数据写入24C02的函数
+void writeTimingSettingsToEEPROM() {
+    if (0 < 0 || 0 + 12 > EEPROM_TOTAL_SIZE) {
+        Serial.println("定时设置数据写入地址超出合理范围");
+        return;
+    }
+    // 检查定时1设置值范围
+    if (startHourForGroup1 < 0 || startHourForGroup1 > 23 || startMinuteForGroup1 < 0 || startMinuteForGroup1 > 59 ||
+        endHourForGroup1 < 0 || endHourForGroup1 > 23 || endMinuteForGroup1 < 0 || endMinuteForGroup1 > 59) {
+        Serial.println("定时1设置值超出合理范围");
+        return;
+    }
+    // 检查定时2设置值范围
+    if (startHourForGroup2 < 0 || startHourForGroup2 > 23 || startMinuteForGroup2 < 0 || startMinuteForGroup2 > 59 ||
+        endHourForGroup2 < 0 || endHourForGroup2 > 23 || endMinuteForGroup2 < 0 || endMinuteForGroup2 > 59) {
+        Serial.println("定时2设置值超出合理范围");
+        return;
+    }
+    // 构建定时1的数据字符串
+    char data1[12];
+    sprintf(data1, "%02d%02d%02d%02d%c", startHourForGroup1, startMinuteForGroup1, endHourForGroup1, endMinuteForGroup1, isTimedGroup1? '1' : '0');
+    // 计算定时1数据的CRC - 8值
+    uint8_t crc1 = calculateCRC8(data1, 12);
+    // 检查定时1数据字符串完整性
+    bool isValid1 = true;
+    for (int i = 0; i < 12; i++) {
+        if (!isprint(data1[i])) {
+            isValid1 = false;
+            Serial.print("定时1写入字符串中位置 ");
+            Serial.print(i);
+            Serial.println(" 存在不可打印字符");
+            break;
+        }
+    }
+    if (isValid1) {
+        Serial.print("定时1写入字符串: ");
+        Serial.println(data1);
+        // 写入定时1数据及CRC值
+        char combinedData1[13];
+        memcpy(combinedData1, data1, 12);
+        combinedData1[12] = crc1;
+        writeEEPROM(0, combinedData1, 13);
+    }
+    // 构建定时2的数据字符串
+    char data2[12];
+    sprintf(data2, "%02d%02d%02d%02d%c", startHourForGroup2, startMinuteForGroup2, endHourForGroup2, endMinuteForGroup2, isTimedGroup2? '1' : '0');
+    // 计算定时2数据的CRC - 8值
+    uint8_t crc2 = calculateCRC8(data2, 12);
+    // 检查定时2数据字符串完整性
+    bool isValid2 = true;
+    for (int i = 0; i < 12; i++) {
+        if (!isprint(data2[i])) {
+            isValid2 = false;
+            Serial.print("定时2写入字符串中位置 ");
+            Serial.print(i);
+            Serial.println(" 存在不可打印字符");
+            break;
+        }
+    }
+    if (isValid2) {
+        Serial.print("定时2写入字符串: ");
+        Serial.println(data2);
+        // 写入定时2数据及CRC值
+        char combinedData2[13];
+        memcpy(combinedData2, data2, 12);
+        combinedData2[12] = crc2;
+        writeEEPROM(12, combinedData2, 13);
+    }
+}
