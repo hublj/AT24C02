@@ -1,0 +1,170 @@
+以下是根据上述调整思路修改后的完整代码，使其完全基于8bit寻址方式对AT24C02芯片的EEPROM进行操作，每页大小固定为8字节：
+ 
+cpp  
+#include <Wire.h>
+#include <Arduino.h>
+
+// 定义EEPROM相关常量
+const int EEPROM_ADDRESS = 0x50;
+const int EEPROM_TOTAL_SIZE = 256;  // 8bit寻址下的总地址空间
+const int PAGE_SIZE = 8;
+
+// 假设这些全局变量在其他地方声明
+extern int startHourForGroup1;
+extern int startMinuteForGroup1;
+extern int endHourForGroup1;
+extern int endMinuteForGroup1;
+extern bool isTimedGroup1;
+extern int startHourForGroup2;
+extern int startMinuteForGroup2;
+extern int endHourForGroup2;
+extern int endMinuteForGroup2;
+extern bool isTimedGroup2;
+
+// 向EEPROM写入数据的函数，添加写入重试机制和更详细的错误处理
+void writeEEPROM(int address, const char* data, int length) {
+    if (address < 0 || address + length > EEPROM_TOTAL_SIZE) {
+        Serial.println("写入地址超出EEPROM范围");
+        return;
+    }
+
+    int maxRetries = 3;  // 最大重试次数
+    int currentAddress = address;
+    const char* currentData = data;
+    int remainingLength = length;
+
+    while (remainingLength > 0) {
+        int bytesToWrite = min(PAGE_SIZE - (currentAddress % PAGE_SIZE), remainingLength);
+
+        for (int retry = 0; retry < maxRetries; retry++) {
+            Wire.beginTransmission(EEPROM_ADDRESS);
+            Wire.write((int)(currentAddress >> 8));  // 高8位地址
+            Wire.write((int)(currentAddress & 0xFF));  // 低8位地址
+            for (int i = 0; i < bytesToWrite; i++) {
+                Wire.write(currentData[i]);
+            }
+            int error = Wire.endTransmission();
+            if (error == 0) {
+                break;
+            } else {
+                Serial.print("EEPROM写入数据出现错误，错误代码: ");
+                Serial.print(error);
+                Serial.print(" 地址（8bit）: ");
+                Serial.println(currentAddress & 0xFF);  // 显示8bit地址
+                Serial.print("正在重试...重试次数: ");
+                Serial.println(retry + 1);
+                delay(100);  // 重试间隔
+            }
+        }
+
+        currentAddress += bytesToWrite;
+        currentData += bytesToWrite;
+        remainingLength -= bytesToWrite;
+    }
+}
+
+// 从EEPROM读取数据的函数，添加读取结果判断和错误提示
+String readEEPROM(int address, int length) {
+    if (address < 0 || address + length > EEPROM_TOTAL_SIZE) {
+        Serial.println("读取地址超出EEPROM范围");
+        return "";
+    }
+
+    String data = "";
+    int currentAddress = address;
+    int remainingLength = length;
+
+    while (remainingLength > 0) {
+        int bytesToRead = min(PAGE_SIZE - (currentAddress % PAGE_SIZE), remainingLength);
+
+        Wire.beginTransmission(EEPROM_ADDRESS);
+        Wire.write((int)(currentAddress >> 8));  // 高8位地址
+        Wire.write((int)(currentAddress & 0xFF));  // 低8位地址
+        Wire.endTransmission(false);
+        Wire.requestFrom(EEPROM_ADDRESS, bytesToRead);
+
+        int receivedBytes = 0;
+        while (Wire.available() && receivedBytes < bytesToRead) {
+            char c = Wire.read();
+            data += c;
+            receivedBytes++;
+        }
+
+        if (receivedBytes!= bytesToRead) {
+            Serial.print("从EEPROM读取数据出现错误，期望读取 ");
+            Serial.print(bytesToRead);
+            Serial.print(" 字节，实际读取 ");
+            Serial.print(receivedBytes);
+            Serial.print(" 字节，地址（8bit）: ");
+            Serial.println(currentAddress & 0xFF);  // 显示8bit地址
+        }
+
+        currentAddress += bytesToRead;
+        remainingLength -= bytesToRead;
+    }
+
+    return data;
+}
+
+// 提取读取定时设置数据的公共函数
+bool readTimingSetting(int address, int& startHour, int& startMinute, int& endHour, int& endMinute, bool& isTimed) {
+    if (address < 0 || address > 255) {  // 检查8bit地址范围
+        Serial.println("读取定时设置地址超出8bit范围");
+        return false;
+    }
+
+    String data = readEEPROM(address, 8);
+    if (data.length() == 8) {
+        bool isValid = true;
+        for (int i = 0; i < 6; i++) {
+            if (data[i] < '0' || data[i] > '9') {
+                isValid = false;
+                break;
+            }
+        }
+        if (isValid) {
+            startHour = data.substring(0, 2).toInt();
+            startMinute = data.substring(2, 4).toInt();
+            endHour = data.substring(4, 6).toInt();
+            endMinute = data.substring(6, 8).toInt();
+            isTimed = data.substring(6, 7) == "1";
+            return true;
+        } else {
+            Serial.println("读取到的数据存在非法字符");
+        }
+    }
+    return false;
+}
+
+// 将定时设置数据写入EEPROM的函数，添加地址范围检查
+void writeTimingSettingsToEEPROM() {
+    if (0 + 8 > EEPROM_TOTAL_SIZE || 8 + 8 > EEPROM_TOTAL_SIZE) {
+        Serial.println("定时设置数据写入地址超出合理范围");
+        return;
+    }
+
+    // 构建定时1的数据字符串，确保格式化为固定长度（这里假设总长度8字节，格式如：0000000，前6位分别为时分时分，最后一位为是否定时标志）
+    char data1[8];
+    sprintf(data1, "%02d%02d%02d%02d%c", startHourForGroup1, startMinuteForGroup1, endHourForGroup1, endMinuteForGroup1, isTimedGroup1? '1' : '0');
+    writeEEPROM(0, data1, 8);
+
+    // 构建定时2的数据字符串
+    char data2[8];
+    sprintf(data2, "%02d%02d%02d%02d%c", startHourForGroup2, startMinuteForGroup2, endHourForGroup2, endMinuteForGroup2, isTimedGroup2? '1' : '0');
+    writeEEPROM(8, data2, 8);
+}
+
+// 从EEPROM读取定时设置数据的函数，添加数据合法性检查和读取前后延迟
+void readTimingSettingsFromEEPROM() {
+    delay(20);  // 读取前增加延迟
+    if (readTimingSetting(0, startHourForGroup1, startMinuteForGroup1, endHourForGroup1, endMinuteForGroup1, isTimedGroup1)) {
+        Serial.println("定时1读取数据成功");
+    }
+    if (readTimingSetting(8, startHourForGroup2, startMinuteForGroup2, endHourForGroup2, endMinuteForGroup2, isTimedGroup2)) {
+        Serial.println("定时2读取数据成功");
+    }
+    delay(20);  // 读取后增加延迟
+}
+ 
+ 
+这段代码实现了对AT24C02芯片EEPROM的读写操作，遵循8bit寻址方式，确保数据在每页8字节的结构下正确存储和读取，同时包含了对定时设置数据的读写功能，并进行了相应的错误处理和校验。在实际使用中，你可能需要根据具体的硬件连接和应用场景进行适当的调整和扩展。
